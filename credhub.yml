@@ -1,0 +1,231 @@
+---
+name: credhub
+
+releases:
+- name: "credhub"
+  version: "2.4.0"
+  url: "https://bosh.io/d/github.com/pivotal-cf/credhub-release?v=2.4.0"
+  sha1: "2e08e5de86288f421fb7eff72a095adb78c31ea8"
+- name: "postgres"
+  version: "37"
+  url: "https://bosh.io/d/github.com/cloudfoundry/postgres-release?v=37"
+  sha1: "0bffec6b98df81219a18ec8da0e19721be799eed"
+- name: "uaa"
+  version: "73.2.0"
+  url: "https://bosh.io/d/github.com/cloudfoundry/uaa-release?v=73.2.0"
+  sha1: "b02cff0706a1a675a144b6e87c74ed2968d980a3"
+- name: "backup-and-restore-sdk"
+  version: "1.15.1"
+  url: "https://bosh.io/d/github.com/cloudfoundry-incubator/backup-and-restore-sdk-release?v=1.15.1"
+  sha1: "364838c384f2edec80866b4abf2397c4c5d15c62"
+- name: "os-conf"
+  version: "21.0.0"
+  url: "https://bosh.io/d/github.com/cloudfoundry/os-conf-release?v=21.0.0"
+  sha1: "7579a96515b265c6d828924bf4f5fae115798199"
+- name: "bpm"
+  version: "1.1.0"
+  url: "https://bosh.io/d/github.com/cloudfoundry/bpm-release?v=1.1.0"
+  sha1: "82e83a5e8ebd6e07f6ca0765e94eb69e03324a19"
+
+stemcells:
+- alias: default
+  os: ubuntu-xenial
+  version: latest
+
+update:
+  canaries: 1
+  max_in_flight: 10
+  update_watch_time: 10000-200000
+  canary_watch_time: 10000-200000
+
+variables:
+- name: credhub-encryption-password
+  type: password
+  options:
+    length: 40
+- name: credhub-ca
+  type: certificate
+  options:
+    is_ca: true
+    common_name: CredHub CA
+- name: credhub-tls
+  type: certificate
+  options:
+    ca: credhub-ca
+    common_name: 10.244.0.34
+    alternative_names:
+    - 127.0.0.1
+- name: database-tls
+  type: certificate
+  options:
+    ca: credhub-ca
+    common_name: 10.244.0.34
+    alternative_names:
+    - 127.0.0.1
+    - localhost
+- name: database-admin
+  type: password
+- name: uaa-tls
+  type: certificate
+  options:
+    ca: credhub-ca
+    common_name: 10.244.0.34
+    alternative_names:
+    - localhost
+- name: uaa-jwt
+  type: rsa
+  options:
+    key_length: 4096
+- name: uaa-admin
+  type: password
+- name: uaa-login
+  type: password
+- name: credhub-mtls-ca
+  type: certificate
+  options:
+    is_ca: true
+    common_name: credhub-mtls-ca
+- name: jumpbox-ssh
+  type: ssh
+- name: uaa-encryption-password
+  type: password
+
+instance_groups:
+- name: credhub
+  instances: 1
+  vm_type: default
+  azs: [z1]
+  stemcell: default
+  networks:
+  - name: default
+    static_ips: [10.244.0.34]
+  jobs:
+  - name: credhub
+    release: credhub
+    properties:
+      credhub:
+        tls: ((credhub-tls))
+        authorization:
+          permissions:
+          - path: /*
+            actors: ["uaa-client:credhub"]
+            operations: [read,write,delete,read_acl,write_acl]
+        authentication:
+          uaa:
+            url: &uaa-url https://10.244.0.34:8443
+            internal_url: https://localhost:8443
+            verification_key: ((uaa-jwt.public_key))
+            ca_certs:
+            - ((uaa-tls.ca))
+          mutual_tls:
+            trusted_cas: [((credhub-mtls-ca.certificate))]
+        data_storage:
+          type: postgres
+          username: admin
+          password: ((database-admin))
+          host: localhost
+          port: 5432
+          database: credhub
+          require_tls: true
+          tls_ca: ((database-tls.ca))
+        encryption:
+          keys:
+          - provider_name: int
+            key_properties:
+              encryption_password: ((credhub-encryption-password))
+            active: true
+          providers:
+          - name: int
+            type: internal
+      bpm:
+        enabled: true
+
+  - name: postgres
+    release: postgres
+    properties:
+      databases:
+        address: 127.0.0.1
+        port: 5432
+        databases:
+        - name: credhub
+        - name: uaa
+        roles:
+        - name: admin
+          password: ((database-admin))
+        tls:
+          ca: ((database-tls.ca))
+          certificate: ((database-tls.certificate))
+          private_key: ((database-tls.private_key))
+
+  - name: uaa
+    release: uaa
+    properties:
+      bpm:
+        enabled: false
+      uaa:
+        url: *uaa-url
+        catalina_opts: -Djava.security.egd=file:/dev/./urandom -Xmx768m -XX:MaxMetaspaceSize=256m
+        clients:
+          credhub:
+            authorized-grant-types: cleint_credentials
+            scope: credhub.read,credhub.write
+            secret: secret
+        admin: {client_secret: ((uaa-admin))}
+        login: {client_secret: ((uaa-login))}
+        zones: {internal: {hostnames: []}}
+        sslCertificate: ((uaa-tls.certificate))
+        sslPrivateKey: ((uaa-tls.private_key))
+        jwt:
+          revocable: true
+          policy:
+            active_key_id: key-1
+            keys:
+              key-1:
+                signingKey: ((uaa-jwt.private_key))
+      uaadb:
+        address: 127.0.0.1
+        port: 5432
+        db_scheme: postgresql
+        tls_enabled: true
+        databases:
+        - tag: uaa
+          name: uaa
+        roles:
+        - tag: admin
+          name: admin
+          password: ((database-admin))
+      login:
+        saml:
+          serviceProviderCertificate: ((uaa-tls.certificate))
+          serviceProviderKey: ((uaa-tls.private_key))
+          serviceProviderKeyPassword: ""
+      encryption:
+        active_key_label: key1
+        encryption_keys:
+        - label: key1
+          passphrase: ((uaa-encryption-password))
+
+  - name: user_add
+    release: os-conf
+    properties:
+      users:
+      - name: bbr
+        public_key: ((jumpbox-ssh.public_key))
+
+  - name: bbr-credhubdb
+    release: credhub
+    properties:
+      release_level_backup: true
+
+  - name: database-backup-restorer
+    release: backup-and-restore-sdk
+    properties: {}
+
+  - name: ca_certs
+    release: os-conf
+    properties:
+      certs: ((database-tls.certificate))
+
+  - name: bpm
+    release: bpm
+    properties: {}
